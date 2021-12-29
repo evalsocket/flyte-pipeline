@@ -1,0 +1,6 @@
+flytekitplugins-kftensorflow>=0.24.0
+tensorflow
+flytekit
+neptune-client
+dataclasses
+dataclasses_json
