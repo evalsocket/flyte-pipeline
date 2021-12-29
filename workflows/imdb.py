@@ -1,11 +1,10 @@
 import os
 import re
 import string
+from typing import Tuple
 import flytekit
-import glob
 from flytekit import task, workflow, Secret, Resources
 from flytekit.types.directory import FlyteDirectory
-from flytekit.remote import FlyteRemote
 from flytekitplugins.kftensorflow import TfJob
 import tensorflow as tf
 from tensorflow.keras import layers
@@ -19,6 +18,7 @@ from dataclasses_json import dataclass_json
 
 SECRET_NAME = "user_secret"
 SECRET_GROUP = "user-info"
+MODEL_FILE_PATH = "saved_model/"
 
 resources = Resources(
     gpu="2", mem="10Gi", storage="10Gi", ephemeral_storage="500Mi"
@@ -110,7 +110,8 @@ def prepare_dataset(data_dir: FlyteDirectory, hyperparameters: Hyperparameters) 
     data_set = get_dataset(data_dir=data_dir, hyperparameters=hyperparameters)
 
     train_text = data_set.train_data.map(lambda x, y: x)
-    vectorized_layer = VectorizedLayer(max_features=hyperparameters.max_features, sequence_length=hyperparameters.sequence_length)
+    vectorized_layer = VectorizedLayer(max_features=hyperparameters.max_features,
+                                       sequence_length=hyperparameters.sequence_length)
     vectorized_layer.adapt(train_text)
 
     data_set.train_data = data_set.train_data.map(vectorized_layer.vectorized_text)
@@ -122,7 +123,8 @@ def prepare_dataset(data_dir: FlyteDirectory, hyperparameters: Hyperparameters) 
     data_set.val_data = data_set.val_data.cache().prefetch(buffer_size=autotune)
     data_set.test_data = data_set.test_data.cache().prefetch(buffer_size=autotune)
 
-    return vectorized_layer,data_set
+    return vectorized_layer, data_set
+
 
 @task(
     task_config=TfJob(num_workers=2, num_ps_replicas=1, num_chief_replicas=1),
@@ -134,17 +136,27 @@ def prepare_dataset(data_dir: FlyteDirectory, hyperparameters: Hyperparameters) 
     limits=resources,
 )
 def create_model(data_set: Dataset, hyperparameters: Hyperparameters, vectorized_layer: VectorizedLayer) \
-        -> FlyteDirectory:
+        -> Tuple[tf.keras.Model, FlyteDirectory]:
+    working_dir = flytekit.current_context().working_directory
+    checkpoint_dir = "training_checkpoints"
+    checkpoint_prefix = os.path.join(working_dir, checkpoint_dir, "ckpt_{epoch}")
 
     run = neptune.init(
         project="evalsocket/flyte-pipeline",
         api_token=flytekit.current_context().secrets.get(SECRET_GROUP, SECRET_NAME),
     )
 
-
-    params = {"max_features": hyperparameters.max_features, "optimizer": "Adam", "epochs": hyperparameters.epochs, "embedding_dim": hyperparameters.embedding_dim}
+    params = {"max_features": hyperparameters.max_features, "optimizer": "Adam", "epochs": hyperparameters.epochs,
+              "embedding_dim": hyperparameters.embedding_dim}
     run["parameters"] = params
-    neptune_cbk = NeptuneCallback(run=run, base_namespace="training")
+
+    callbacks = [
+        tf.keras.callbacks.TensorBoard(log_dir="./logs"),
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=checkpoint_prefix, save_weights_only=True
+        ),
+        NeptuneCallback(run=run, base_namespace="training"),
+    ]
 
     model = tf.keras.Sequential([
         layers.Embedding(hyperparameters.max_features + 1, hyperparameters.embedding_dim),
@@ -159,14 +171,10 @@ def create_model(data_set: Dataset, hyperparameters: Hyperparameters, vectorized
         data_set.train_data,
         validation_data=data_set.val_data,
         epochs=hyperparameters.epochs,
-        callbacks=[neptune_cbk],
+        callbacks=callbacks,
     )
-    model.save('imdb')
-    run['imdb/saved_model'].upload('imdb/saved_model.pb')
-    for name in glob.glob('imdb/variables/*'):
-        run[name].upload(name)
 
-    working_dir = flytekit.current_context().working_directory
+    model.save(MODEL_FILE_PATH, save_format="tf")
 
     export_model = tf.keras.Sequential([
         vectorized_layer,
@@ -182,17 +190,7 @@ def create_model(data_set: Dataset, hyperparameters: Hyperparameters, vectorized
     for j, metric in enumerate(eval_metrics):
         run["eval/{}".format(model.metrics_names[j])] = metric
 
-    return FlyteDirectory(path=os.path.join(working_dir, "imdb"))
-
-
-@task
-def server_model_server(domain: str, project: str):
-        # TODO: Add logic for getting output of a execution and use it for serving
-        remote = FlyteRemote.from_config(
-            default_project=project,
-            default_domain=domain,
-            config_file_path="./config",
-        )
+    return model, FlyteDirectory(path=os.path.join(working_dir, checkpoint_dir))
 
 
 @workflow
@@ -202,13 +200,8 @@ def train_and_export(uri: str, hyperparameters: Hyperparameters = Hyperparameter
     vectorized_layer, data_set = prepare_dataset(
         data_dir=data, hyperparameters=hyperparameters)
     model = create_model(data_set=data_set, hyperparameters=hyperparameters,
-                                         vectorized_layer=vectorized_layer)
+                         vectorized_layer=vectorized_layer)
     return model
-
-
-@workflow
-def serve(domain: str, project: str):
-    server_model_server(domain=domain,project=project)
 
 
 if __name__ == "__main__":
