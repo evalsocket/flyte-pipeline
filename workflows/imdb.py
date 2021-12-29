@@ -195,13 +195,13 @@ def create_model(data_set: Dataset, hyperparameters: Hyperparameters, vectorized
 
 @workflow
 def train_and_export(uri: str, hyperparameters: Hyperparameters = Hyperparameters()) \
-        -> FlyteDirectory:
+        -> Tuple[tf.keras.Model, FlyteDirectory]:
     data = download_dataset(uri=uri)
     vectorized_layer, data_set = prepare_dataset(
         data_dir=data, hyperparameters=hyperparameters)
-    model = create_model(data_set=data_set, hyperparameters=hyperparameters,
-                         vectorized_layer=vectorized_layer)
-    return model
+    model, checkpoint = create_model(data_set=data_set, hyperparameters=hyperparameters,
+                                     vectorized_layer=vectorized_layer)
+    return model, checkpoint
 
 
 if __name__ == "__main__":
